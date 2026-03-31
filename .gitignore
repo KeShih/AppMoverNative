@@ -2,6 +2,8 @@
 /.build
 /dist
 /Packages
+.claude/
+Packaging/AppIcon.iconset/
 xcuserdata/
 DerivedData/
 .swiftpm/
