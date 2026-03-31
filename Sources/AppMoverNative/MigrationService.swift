@@ -120,7 +120,7 @@ struct MigrationService: Sendable {
             externalPath: externalAppURL.path,
             destinationRootPath: destinationDirectory.path
         )
-        repairDockPinnedItem(for: app, targetURL: app.originalURL, matchingURLs: [externalAppURL])
+        repairDockPinnedItem(for: app, targetURL: externalAppURL, matchingURLs: [app.originalURL])
     }
 
     func createSystemLink(for app: ManagedApp) throws {
@@ -161,7 +161,7 @@ struct MigrationService: Sendable {
             externalPath: externalURL.path,
             destinationRootPath: destinationRoot.path
         )
-        repairDockPinnedItem(for: app, targetURL: app.originalURL, matchingURLs: [externalURL])
+        repairDockPinnedItem(for: app, targetURL: externalURL, matchingURLs: [app.originalURL])
     }
 
     func restore(_ app: ManagedApp) throws {

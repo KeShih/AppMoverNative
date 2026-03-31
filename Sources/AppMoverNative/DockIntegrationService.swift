@@ -33,11 +33,6 @@ struct DockIntegrationService: Sendable {
             throw DockIntegrationError.invalidDockPreferences
         }
 
-        let bookmarkData = try targetURL.bookmarkData(
-            options: [],
-            includingResourceValuesForKeys: nil,
-            relativeTo: nil
-        )
         let bundleIdentifier = resolvedBundleIdentifier(for: targetURL) ?? app.bundleIdentifier
         let candidatePaths = Set(
             ([app.originalURL, app.currentURL, targetURL] + matchingURLs)
@@ -51,7 +46,7 @@ struct DockIntegrationService: Sendable {
             guard persistentApps[index]["tile-type"] as? String == "file-tile" else {
                 continue
             }
-            guard var tileData = persistentApps[index]["tile-data"] as? [String: Any] else {
+            guard let tileData = persistentApps[index]["tile-data"] as? [String: Any] else {
                 continue
             }
 
@@ -67,19 +62,11 @@ struct DockIntegrationService: Sendable {
                 continue
             }
 
-            var updatedFileData = fileData
-            updatedFileData["_CFURLString"] = targetURL.absoluteString
-            updatedFileData["_CFURLStringType"] = fileData["_CFURLStringType"] ?? 15
-
-            tileData["book"] = bookmarkData
-            tileData["file-data"] = updatedFileData
-            tileData["file-label"] = app.displayName
-
-            if let bundleIdentifier {
-                tileData["bundle-identifier"] = bundleIdentifier
-            }
-
-            persistentApps[index]["tile-data"] = tileData
+            persistentApps[index] = makeFreshDockEntry(
+                targetURL: targetURL,
+                bundleIdentifier: bundleIdentifier,
+                existingGUID: persistentApps[index]["GUID"] as? Int
+            )
             didUpdate = true
         }
 
@@ -117,6 +104,29 @@ struct DockIntegrationService: Sendable {
 
     private func normalizedDirectoryURL(_ url: URL) -> URL {
         URL(fileURLWithPath: url.path, isDirectory: true)
+    }
+
+    private func makeFreshDockEntry(
+        targetURL: URL,
+        bundleIdentifier: String?,
+        existingGUID: Int?
+    ) -> [String: Any] {
+        var tileData: [String: Any] = [
+            "file-data": [
+                "_CFURLString": targetURL.absoluteString,
+                "_CFURLStringType": 15,
+            ],
+        ]
+
+        if let bundleIdentifier {
+            tileData["bundle-identifier"] = bundleIdentifier
+        }
+
+        return [
+            "GUID": existingGUID ?? Int.random(in: 1...Int(Int32.max)),
+            "tile-data": tileData,
+            "tile-type": "file-tile",
+        ]
     }
 
     private func restartDock() throws {
