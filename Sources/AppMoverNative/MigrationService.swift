@@ -25,6 +25,7 @@ enum MigrationError: LocalizedError {
 
 struct MigrationService: Sendable {
     private let applicationsURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+    private let dockIntegrationService = DockIntegrationService()
 
     func loadSnapshot() throws -> AppSnapshot {
         let manifestEntries = loadManifest()
@@ -119,6 +120,7 @@ struct MigrationService: Sendable {
             externalPath: externalAppURL.path,
             destinationRootPath: destinationDirectory.path
         )
+        repairDockPinnedItem(for: app, targetURL: app.originalURL, matchingURLs: [externalAppURL])
     }
 
     func createSystemLink(for app: ManagedApp) throws {
@@ -159,6 +161,7 @@ struct MigrationService: Sendable {
             externalPath: externalURL.path,
             destinationRootPath: destinationRoot.path
         )
+        repairDockPinnedItem(for: app, targetURL: app.originalURL, matchingURLs: [externalURL])
     }
 
     func restore(_ app: ManagedApp) throws {
@@ -234,6 +237,7 @@ struct MigrationService: Sendable {
 
         let manifestEntries = loadManifest().filter { $0.originalPath != app.originalURL.path }
         try saveManifest(manifestEntries)
+        repairDockPinnedItem(for: app, targetURL: app.originalURL, matchingURLs: [externalURL])
     }
 
     private func upsertMigrationEntry(
@@ -504,6 +508,18 @@ struct MigrationService: Sendable {
     private func manifestFileURL() -> URL {
         manifestDirectoryURL()
             .appendingPathComponent("migrations.json", isDirectory: false)
+    }
+
+    private func repairDockPinnedItem(for app: ManagedApp, targetURL: URL, matchingURLs: [URL]) {
+        do {
+            try dockIntegrationService.repairPinnedItem(
+                for: app,
+                targetURL: targetURL,
+                matchingURLs: matchingURLs
+            )
+        } catch {
+            NSLog("Dock repair failed for %@: %@", app.displayName, error.localizedDescription)
+        }
     }
 
     private func runPrivilegedShell(_ shellScript: String) throws {
