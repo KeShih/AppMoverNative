@@ -15,9 +15,17 @@ final class AppMoverViewModel: ObservableObject {
 
     private let service = MigrationService()
     private let destinationDefaultsKey = "selectedDestinationRootPath"
+    private let destinationSelectionKindDefaultsKey = "selectedDestinationSelectionKind"
     private let defaults = UserDefaults.standard
+    private var destinationSelectionKind: DestinationSelectionKind
 
     init() {
+        let savedPath = defaults.string(forKey: destinationDefaultsKey) ?? ""
+        let savedKindRaw = defaults.string(forKey: destinationSelectionKindDefaultsKey) ?? ""
+        destinationSelectionKind = DestinationSelectionKind(
+            rawValue: savedKindRaw
+        ) ?? Self.inferSelectionKind(fromLegacySavedPath: savedPath)
+
         if let savedPath = defaults.string(forKey: destinationDefaultsKey), !savedPath.isEmpty {
             destinationRoot = URL(fileURLWithPath: savedPath, isDirectory: true)
         }
@@ -56,7 +64,7 @@ final class AppMoverViewModel: ObservableObject {
         }
 
         selectedVolumeID = volume.id
-        setDestinationRoot(volume.destinationRoot)
+        setDestinationRoot(volume.destinationRoot, kind: .volumeRoot)
         infoMessage = "目标已切换到 \(volume.name)"
         errorMessage = nil
     }
@@ -80,14 +88,14 @@ final class AppMoverViewModel: ObservableObject {
             return
         }
 
-        setDestinationRoot(url)
+        setDestinationRoot(url, kind: .customDirectory)
         selectedVolumeID = volumeID(containing: url) ?? ""
         infoMessage = "目标目录已更新"
         errorMessage = nil
     }
 
     func migrate(_ app: ManagedApp) async {
-        guard let destinationRoot else {
+        guard let destinationRoot, let destinationDirectory else {
             errorMessage = "请先选择外置硬盘目标目录。"
             return
         }
@@ -100,12 +108,14 @@ final class AppMoverViewModel: ObservableObject {
         errorMessage = nil
         infoMessage = nil
         isBusy = true
-        activityMessage = "正在迁移 \(app.displayName)..."
+        activityMessage = "正在准备迁移 \(app.displayName)..."
 
         do {
+            try await stopRunningProcesses(for: app)
+
             let service = self.service
             try await Task.detached(priority: .userInitiated) {
-                try service.migrate(app, to: destinationRoot)
+                try service.migrate(app, to: destinationDirectory)
             }.value
 
             infoMessage = "\(app.displayName) 已迁移到外置盘，并在 /Applications 保留了符号链接。"
@@ -121,9 +131,11 @@ final class AppMoverViewModel: ObservableObject {
         errorMessage = nil
         infoMessage = nil
         isBusy = true
-        activityMessage = "正在恢复 \(app.displayName)..."
+        activityMessage = "正在准备恢复 \(app.displayName)..."
 
         do {
+            try await stopRunningProcesses(for: app)
+
             let service = self.service
             try await Task.detached(priority: .userInitiated) {
                 try service.restore(app)
@@ -181,10 +193,10 @@ final class AppMoverViewModel: ObservableObject {
     }
 
     var destinationSummary: String {
-        guard let destinationRoot else {
-            return "尚未选择外置盘目录"
+        guard let destinationDirectory else {
+            return "尚未选择外置盘 Applications 目录"
         }
-        return destinationRoot.path
+        return destinationDirectory.path
     }
 
     var mountedStatusText: String {
@@ -231,13 +243,29 @@ final class AppMoverViewModel: ObservableObject {
         return "\(selectedVolume.name) 当前是 \(selectedVolume.formatSummary)，不建议直接放置 macOS `.app`，可能影响权限、扩展属性或签名。"
     }
 
-    private func setDestinationRoot(_ url: URL) {
+    var destinationDirectory: URL? {
+        guard let destinationRoot else {
+            return nil
+        }
+
+        switch destinationSelectionKind {
+        case .volumeRoot:
+            return destinationRoot.appendingPathComponent("Applications", isDirectory: true)
+        case .customDirectory:
+            return destinationRoot
+        }
+    }
+
+    private func setDestinationRoot(_ url: URL, kind: DestinationSelectionKind) {
         destinationRoot = url
+        destinationSelectionKind = kind
         defaults.set(url.path, forKey: destinationDefaultsKey)
+        defaults.set(kind.rawValue, forKey: destinationSelectionKindDefaultsKey)
     }
 
     private func alignDestinationSelection(using volumes: [StorageVolume]) {
         if let destinationRoot {
+            destinationSelectionKind = inferredSelectionKind(for: destinationRoot, volumes: volumes)
             selectedVolumeID = volumeID(containing: destinationRoot) ?? selectedVolumeID
             if selectedVolumeID.isEmpty, destinationRoot.path.hasPrefix("/Volumes/"), mountedVolumeExists(for: destinationRoot) {
                 return
@@ -246,7 +274,7 @@ final class AppMoverViewModel: ObservableObject {
 
         if destinationRoot == nil, let firstVolume = volumes.first {
             selectedVolumeID = firstVolume.id
-            setDestinationRoot(firstVolume.destinationRoot)
+            setDestinationRoot(firstVolume.destinationRoot, kind: .volumeRoot)
         }
     }
 
@@ -275,4 +303,103 @@ final class AppMoverViewModel: ObservableObject {
         }
         return NSString.path(withComponents: Array(components.prefix(3)))
     }
+
+    private func stopRunningProcesses(for app: ManagedApp) async throws {
+        let runningApps = runningApplications(matching: app)
+        guard !runningApps.isEmpty else {
+            return
+        }
+
+        activityMessage = "正在退出 \(app.displayName)..."
+
+        for runningApp in runningApps where !runningApp.isTerminated {
+            _ = runningApp.terminate()
+        }
+
+        try await waitForTermination(of: runningApps, timeout: 3.0)
+
+        let stubbornApps = runningApps.filter { !$0.isTerminated }
+        for runningApp in stubbornApps {
+            _ = runningApp.forceTerminate()
+        }
+
+        try await waitForTermination(of: stubbornApps, timeout: 2.0)
+
+        guard runningApps.allSatisfy(\.isTerminated) else {
+            throw MigrationError.commandFailed("无法停止 \(app.displayName) 的运行进程，请手动退出后重试。")
+        }
+    }
+
+    private func waitForTermination(of runningApps: [NSRunningApplication], timeout: TimeInterval) async throws {
+        guard !runningApps.isEmpty else {
+            return
+        }
+
+        let interval: UInt64 = 200_000_000
+        let maxChecks = max(1, Int((timeout / 0.2).rounded(.up)))
+
+        for _ in 0..<maxChecks {
+            if runningApps.allSatisfy(\.isTerminated) {
+                return
+            }
+
+            try await Task.sleep(nanoseconds: interval)
+        }
+    }
+
+    private func runningApplications(matching app: ManagedApp) -> [NSRunningApplication] {
+        let currentProcessID = ProcessInfo.processInfo.processIdentifier
+        let knownPaths = matchedBundlePaths(for: app)
+
+        return NSWorkspace.shared.runningApplications.filter { runningApp in
+            guard runningApp.processIdentifier != currentProcessID else {
+                return false
+            }
+
+            if let bundleIdentifier = app.bundleIdentifier, runningApp.bundleIdentifier == bundleIdentifier {
+                return true
+            }
+
+            guard let bundleURL = runningApp.bundleURL?.resolvingSymlinksInPath() else {
+                return false
+            }
+
+            let bundlePath = bundleURL.path
+            return knownPaths.contains(where: { path in
+                bundlePath == path || bundlePath.hasPrefix(path + "/") || path.hasPrefix(bundlePath + "/")
+            })
+        }
+    }
+
+    private func matchedBundlePaths(for app: ManagedApp) -> Set<String> {
+        let candidates = [
+            app.originalURL.path,
+            app.currentURL.path,
+            app.originalURL.resolvingSymlinksInPath().path,
+            app.currentURL.resolvingSymlinksInPath().path,
+        ]
+
+        return Set(candidates.filter { !$0.isEmpty })
+    }
+
+    private func inferredSelectionKind(for url: URL, volumes: [StorageVolume]) -> DestinationSelectionKind {
+        if volumes.contains(where: { $0.url.path == url.path }) {
+            return .volumeRoot
+        }
+        return .customDirectory
+    }
+
+    private static func inferSelectionKind(fromLegacySavedPath path: String) -> DestinationSelectionKind {
+        guard path.hasPrefix("/Volumes/") else {
+            return .customDirectory
+        }
+
+        let components = URL(fileURLWithPath: path, isDirectory: true).pathComponents
+        return components.count == 3 ? .volumeRoot : .customDirectory
+    }
+}
+
+private enum DestinationSelectionKind: String {
+    case volumeRoot
+    case customDirectory
 }

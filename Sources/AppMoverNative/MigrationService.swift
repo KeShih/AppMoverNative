@@ -43,15 +43,14 @@ struct MigrationService: Sendable {
         )
     }
 
-    func migrate(_ app: ManagedApp, to destinationRoot: URL) throws {
-        guard destinationRoot.path.hasPrefix("/Volumes/") else {
+    func migrate(_ app: ManagedApp, to destinationDirectory: URL) throws {
+        guard destinationDirectory.path.hasPrefix("/Volumes/") else {
             throw MigrationError.invalidDestination
         }
         guard !app.isAppleApp else {
             throw MigrationError.unsupportedApp(app.displayName)
         }
 
-        let destinationDirectory = destinationRoot.appendingPathComponent("Applications", isDirectory: true)
         let externalAppURL = destinationDirectory.appendingPathComponent(app.originalURL.lastPathComponent, isDirectory: true)
         let backupURL = applicationsURL.appendingPathComponent(".appmover-backup-\(UUID().uuidString)", isDirectory: true)
         let copyScript = """
@@ -118,7 +117,7 @@ struct MigrationService: Sendable {
             appName: app.displayName,
             originalPath: app.originalURL.path,
             externalPath: externalAppURL.path,
-            destinationRootPath: destinationRoot.path
+            destinationRootPath: destinationDirectory.path
         )
     }
 
@@ -290,11 +289,11 @@ struct MigrationService: Sendable {
                         bundleIdentifier: bundleIdentifier(for: resolvedURL),
                         originalURL: itemURL,
                         currentURL: resolvedURL,
-                        residency: .migrated(
-                            externalURL: resolvedURL,
-                            destinationRoot: URL(fileURLWithPath: manifestEntry?.destinationRootPath ?? resolvedURL.deletingLastPathComponent().deletingLastPathComponent().path, isDirectory: true),
-                            isReachable: isReachable
-                        ),
+                            residency: .migrated(
+                                externalURL: resolvedURL,
+                                destinationRoot: URL(fileURLWithPath: manifestEntry?.destinationRootPath ?? resolvedURL.deletingLastPathComponent().path, isDirectory: true),
+                                isReachable: isReachable
+                            ),
                         hasSystemLink: true
                     )
                 )
@@ -408,7 +407,7 @@ struct MigrationService: Sendable {
         let parentDirectory = appURL.deletingLastPathComponent()
 
         if parentDirectory.lastPathComponent == "Applications" {
-            return parentDirectory.deletingLastPathComponent()
+            return parentDirectory
         }
 
         if parentDirectory.path.hasPrefix(volume.url.path) {
@@ -423,7 +422,7 @@ struct MigrationService: Sendable {
             return nil
         }
 
-        let destinationRoot = resolvedURL.deletingLastPathComponent().deletingLastPathComponent()
+        let destinationRoot = resolvedURL.deletingLastPathComponent()
         return MigrationEntry(
             appName: originalURL.deletingPathExtension().lastPathComponent,
             originalPath: originalURL.path,

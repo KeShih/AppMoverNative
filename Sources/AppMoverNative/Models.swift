@@ -10,7 +10,6 @@ struct StorageVolume: Identifiable, Hashable, Sendable {
 
     var destinationRoot: URL {
         url
-            .appendingPathComponent("AppMoverNative", isDirectory: true)
     }
 
     var isRecommendedForAppBundles: Bool {

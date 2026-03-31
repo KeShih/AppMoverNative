@@ -79,48 +79,10 @@ struct ContentView: View {
 
     private var toolbar: some View {
         HStack(spacing: 12) {
-            Text("AppMover")
-                .font(.system(size: 13, weight: .semibold))
+            leadingToolbarGroup
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-            Color(nsColor: .separatorColor)
-                .frame(width: 1, height: 14)
-
-            if viewModel.availableVolumes.isEmpty {
-                Text("无可用外置盘")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-            } else {
-                Picker("", selection: Binding(
-                    get: { viewModel.selectedVolumeID },
-                    set: { viewModel.chooseSuggestedVolume($0) }
-                )) {
-                    ForEach(viewModel.availableVolumes) { volume in
-                        Text(volume.name).tag(volume.id)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .controlSize(.small)
-                .frame(maxWidth: 160)
-            }
-
-            Text(viewModel.destinationSummary)
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: 240, alignment: .leading)
-
-            mountBadge
-
-            if let warning = viewModel.destinationVolumeWarning {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.orange)
-                    .help(warning)
-            }
-
-            Spacer()
+            Spacer(minLength: 12)
 
             Picker("", selection: layoutModeBinding) {
                 Image(systemName: "list.bullet").tag(AppLayoutMode.list)
@@ -147,9 +109,51 @@ struct ContentView: View {
     }
 
     @ViewBuilder
+    private var leadingToolbarGroup: some View {
+        HStack(spacing: 8) {
+            if viewModel.availableVolumes.isEmpty {
+                Text("无可用外置盘")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            } else {
+                Picker("", selection: Binding(
+                    get: { viewModel.selectedVolumeID },
+                    set: { viewModel.chooseSuggestedVolume($0) }
+                )) {
+                    ForEach(viewModel.availableVolumes) { volume in
+                        Text(volume.name).tag(volume.id)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .controlSize(.small)
+                .frame(maxWidth: 180, alignment: .leading)
+                .fixedSize(horizontal: true, vertical: false)
+            }
+
+            Text(viewModel.destinationSummary)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .layoutPriority(1)
+
+            mountBadge
+                .fixedSize(horizontal: true, vertical: false)
+
+            if let warning = viewModel.destinationVolumeWarning {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+                    .help(warning)
+            }
+        }
+    }
+
+    @ViewBuilder
     private var mountBadge: some View {
         let ready = viewModel.mountedStatusText == "已就绪"
-        HStack(spacing: 4) {
+        HStack(spacing: 3) {
             Circle()
                 .fill(ready ? Color(nsColor: .systemGreen) : Color(nsColor: .quaternaryLabelColor))
                 .frame(width: 6, height: 6)
@@ -627,7 +631,7 @@ struct PendingOperation: Identifiable {
         let base: String
         switch kind {
         case .migrate:
-            base = "应用会被复制到以下目录，并在 /Applications 原位改成符号链接：\n\(targetPath)"
+            base = "开始前会先尝试退出该应用的运行中进程；如果无法退出，会中止迁移。\n\n应用会被复制到以下目录，并在 /Applications 原位改成符号链接：\n\(targetPath)"
         case .createLink:
             base = "会在以下位置创建指向外置盘应用的符号链接，不会复制应用文件：\n\(targetPath)"
         case .restore:
