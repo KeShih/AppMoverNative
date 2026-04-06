@@ -38,6 +38,7 @@ struct ManagedApp: Identifiable, Hashable, Sendable {
     let id: String
     let displayName: String
     let bundleIdentifier: String?
+    let bundleSize: Int64?
     let originalURL: URL
     let currentURL: URL
     let residency: AppResidency
@@ -77,6 +78,19 @@ struct ManagedApp: Identifiable, Hashable, Sendable {
         }
     }
 
+    var canRemove: Bool {
+        guard !isAppleApp else {
+            return false
+        }
+
+        switch residency {
+        case .local:
+            return true
+        case let .migrated(_, _, isReachable):
+            return isReachable
+        }
+    }
+
     var launchURL: URL {
         if isMigrated {
             return hasSystemLink ? originalURL : currentURL
@@ -84,8 +98,49 @@ struct ManagedApp: Identifiable, Hashable, Sendable {
         return currentURL
     }
 
+    var preferredIconPath: String {
+        switch residency {
+        case .local:
+            return currentURL.path
+        case let .migrated(_, _, isReachable):
+            if isReachable {
+                return currentURL.path
+            }
+            return hasSystemLink ? originalURL.path : currentURL.path
+        }
+    }
+
     var isAppleApp: Bool {
         bundleIdentifier?.hasPrefix("com.apple.") == true
+    }
+
+    var sizeText: String? {
+        guard let bundleSize else {
+            return nil
+        }
+
+        return ByteCountFormatter.string(fromByteCount: bundleSize, countStyle: .file)
+    }
+
+    var metadataText: String? {
+        var parts: [String] = []
+
+        if let sizeText {
+            parts.append(sizeText)
+        }
+
+        switch residency {
+        case .local:
+            break
+        case let .migrated(_, _, isReachable):
+            if hasSystemLink {
+                parts.append(isReachable ? "系统链接已就绪" : "外置盘未连接")
+            } else {
+                parts.append(isReachable ? "无系统链接" : "外置盘未连接")
+            }
+        }
+
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     var residencyText: String {

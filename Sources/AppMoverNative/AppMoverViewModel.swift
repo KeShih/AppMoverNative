@@ -18,6 +18,8 @@ final class AppMoverViewModel: ObservableObject {
     private let destinationSelectionKindDefaultsKey = "selectedDestinationSelectionKind"
     private let defaults = UserDefaults.standard
     private var destinationSelectionKind: DestinationSelectionKind
+    private var detailRefreshTask: Task<Void, Never>?
+    private var refreshGeneration = 0
 
     init() {
         let savedPath = defaults.string(forKey: destinationDefaultsKey) ?? ""
@@ -36,6 +38,10 @@ final class AppMoverViewModel: ObservableObject {
     }
 
     func refresh() async {
+        refreshGeneration += 1
+        let generation = refreshGeneration
+        detailRefreshTask?.cancel()
+
         errorMessage = nil
         isBusy = true
         activityMessage = "正在扫描应用与磁盘..."
@@ -43,19 +49,27 @@ final class AppMoverViewModel: ObservableObject {
         do {
             let service = self.service
             let snapshot = try await Task.detached(priority: .userInitiated) {
-                try service.loadSnapshot()
+                try service.loadSnapshot(
+                    includeBundleSizes: false,
+                    includeExternalStandaloneApps: false
+                )
             }.value
 
             localApps = snapshot.localApps
             migratedApps = snapshot.migratedApps
             availableVolumes = snapshot.availableVolumes
             alignDestinationSelection(using: snapshot.availableVolumes)
+            startDeferredRefresh(for: generation)
         } catch {
             errorMessage = error.localizedDescription
         }
 
         isBusy = false
         activityMessage = "空闲"
+    }
+
+    deinit {
+        detailRefreshTask?.cancel()
     }
 
     func chooseSuggestedVolume(_ volumeID: String) {
@@ -95,6 +109,15 @@ final class AppMoverViewModel: ObservableObject {
     }
 
     func migrate(_ app: ManagedApp) async {
+        await migrate([app])
+    }
+
+    func migrate(_ apps: [ManagedApp]) async {
+        let apps = uniqueApps(apps)
+        guard !apps.isEmpty else {
+            return
+        }
+
         guard let destinationRoot, let destinationDirectory else {
             errorMessage = "请先选择外置硬盘目标目录。"
             return
@@ -105,70 +128,137 @@ final class AppMoverViewModel: ObservableObject {
             return
         }
 
-        errorMessage = nil
-        infoMessage = nil
-        isBusy = true
-        activityMessage = "正在准备迁移 \(app.displayName)..."
-
-        do {
-            try await stopRunningProcesses(for: app)
-
-            let service = self.service
-            try await Task.detached(priority: .userInitiated) {
+        await performBatch(
+            apps: apps,
+            stopRunningApps: true,
+            preflightMessage: "正在检查目标外置盘可用空间...",
+            preflight: { service, apps in
+                try service.validateMigrationSpace(for: apps, to: destinationDirectory)
+            },
+            progressMessage: { index, count, app in
+                if count == 1 {
+                    return "正在准备迁移 \(app.displayName)..."
+                }
+                return "正在迁移 \(index + 1)/\(count)：\(app.displayName)..."
+            },
+            operation: { service, app in
                 try service.migrate(app, to: destinationDirectory)
-            }.value
-
-            infoMessage = "\(app.displayName) 已迁移到外置盘，并在 /Applications 保留了符号链接。"
-            await refresh()
-        } catch {
-            errorMessage = error.localizedDescription
-            isBusy = false
-            activityMessage = "空闲"
-        }
+            },
+            successMessage: { apps in
+                if apps.count == 1, let app = apps.first {
+                    return "\(app.displayName) 已迁移到外置盘，并在 /Applications 保留了符号链接。"
+                }
+                return "已迁移 \(apps.count) 个应用到外置盘，并在 /Applications 保留了符号链接。"
+            }
+        )
     }
 
     func restore(_ app: ManagedApp) async {
-        errorMessage = nil
-        infoMessage = nil
-        isBusy = true
-        activityMessage = "正在准备恢复 \(app.displayName)..."
+        await restore([app])
+    }
 
-        do {
-            try await stopRunningProcesses(for: app)
-
-            let service = self.service
-            try await Task.detached(priority: .userInitiated) {
+    func restore(_ apps: [ManagedApp]) async {
+        await performBatch(
+            apps: uniqueApps(apps),
+            stopRunningApps: true,
+            preflightMessage: "正在检查系统盘可用空间...",
+            preflight: { service, apps in
+                try service.validateRestoreSpace(for: apps)
+            },
+            progressMessage: { index, count, app in
+                if count == 1 {
+                    return "正在准备恢复 \(app.displayName)..."
+                }
+                return "正在恢复 \(index + 1)/\(count)：\(app.displayName)..."
+            },
+            operation: { service, app in
                 try service.restore(app)
-            }.value
-
-            infoMessage = "\(app.displayName) 已恢复回系统盘。"
-            await refresh()
-        } catch {
-            errorMessage = error.localizedDescription
-            isBusy = false
-            activityMessage = "空闲"
-        }
+            },
+            successMessage: { apps in
+                if apps.count == 1, let app = apps.first {
+                    return "\(app.displayName) 已恢复回系统盘。"
+                }
+                return "已恢复 \(apps.count) 个应用回系统盘。"
+            }
+        )
     }
 
     func createSystemLink(_ app: ManagedApp) async {
-        errorMessage = nil
-        infoMessage = nil
-        isBusy = true
-        activityMessage = "正在为 \(app.displayName) 创建系统链接..."
+        await createSystemLink([app])
+    }
 
-        do {
-            let service = self.service
-            try await Task.detached(priority: .userInitiated) {
+    func createSystemLink(_ apps: [ManagedApp]) async {
+        await performBatch(
+            apps: uniqueApps(apps),
+            stopRunningApps: false,
+            progressMessage: { index, count, app in
+                if count == 1 {
+                    return "正在为 \(app.displayName) 创建系统链接..."
+                }
+                return "正在创建链接 \(index + 1)/\(count)：\(app.displayName)..."
+            },
+            operation: { service, app in
                 try service.createSystemLink(for: app)
-            }.value
+            },
+            successMessage: { apps in
+                if apps.count == 1, let app = apps.first {
+                    return "\(app.displayName) 已在 /Applications 创建符号链接。"
+                }
+                return "已为 \(apps.count) 个应用创建系统链接。"
+            }
+        )
+    }
 
-            infoMessage = "\(app.displayName) 已在 /Applications 创建符号链接。"
-            await refresh()
-        } catch {
-            errorMessage = error.localizedDescription
-            isBusy = false
-            activityMessage = "空闲"
-        }
+    func moveToTrash(_ app: ManagedApp) async {
+        await moveToTrash([app])
+    }
+
+    func moveToTrash(_ apps: [ManagedApp]) async {
+        await performBatch(
+            apps: uniqueApps(apps),
+            stopRunningApps: true,
+            progressMessage: { index, count, app in
+                if count == 1 {
+                    return "正在准备将 \(app.displayName) 移到废纸篓..."
+                }
+                return "正在移到废纸篓 \(index + 1)/\(count)：\(app.displayName)..."
+            },
+            operation: { service, app in
+                try service.moveToTrash(app)
+            },
+            successMessage: { apps in
+                if apps.count == 1, let app = apps.first {
+                    return "\(app.displayName) 已移到废纸篓。"
+                }
+                return "已将 \(apps.count) 个应用移到废纸篓。"
+            }
+        )
+    }
+
+    func deletePermanently(_ app: ManagedApp) async {
+        await deletePermanently([app])
+    }
+
+    func deletePermanently(_ apps: [ManagedApp]) async {
+        await performBatch(
+            apps: uniqueApps(apps),
+            stopRunningApps: true,
+            progressMessage: { index, count, app in
+                if count == 1 {
+                    return "正在准备永久删除 \(app.displayName)..."
+                }
+                return "正在永久删除 \(index + 1)/\(count)：\(app.displayName)..."
+            },
+            operation: { service, app in
+                try service.deletePermanently(app)
+            },
+            successMessage: { apps in
+                if apps.count == 1, let app = apps.first {
+                    return "\(app.displayName) 已永久删除。"
+                }
+                return "已永久删除 \(apps.count) 个应用。"
+            }
+        )
     }
 
     func open(_ app: ManagedApp) {
@@ -380,6 +470,87 @@ final class AppMoverViewModel: ObservableObject {
         ]
 
         return Set(candidates.filter { !$0.isEmpty })
+    }
+
+    private func uniqueApps(_ apps: [ManagedApp]) -> [ManagedApp] {
+        var seen = Set<String>()
+        return apps.filter { seen.insert($0.id).inserted }
+    }
+
+    private func performBatch(
+        apps: [ManagedApp],
+        stopRunningApps: Bool,
+        preflightMessage: String? = nil,
+        preflight: (@Sendable (MigrationService, [ManagedApp]) throws -> Void)? = nil,
+        progressMessage: (_ index: Int, _ count: Int, _ app: ManagedApp) -> String,
+        operation: @escaping @Sendable (MigrationService, ManagedApp) throws -> Void,
+        successMessage: ([ManagedApp]) -> String
+    ) async {
+        guard !apps.isEmpty else {
+            return
+        }
+
+        errorMessage = nil
+        infoMessage = nil
+        isBusy = true
+
+        do {
+            let service = self.service
+
+            if let preflight {
+                activityMessage = preflightMessage ?? "正在检查操作条件..."
+                try await Task.detached(priority: .userInitiated) {
+                    try preflight(service, apps)
+                }.value
+            }
+
+            for (index, app) in apps.enumerated() {
+                activityMessage = progressMessage(index, apps.count, app)
+
+                if stopRunningApps {
+                    try await stopRunningProcesses(for: app)
+                }
+
+                try await Task.detached(priority: .userInitiated) {
+                    try operation(service, app)
+                }.value
+            }
+
+            infoMessage = successMessage(apps)
+            await refresh()
+        } catch {
+            errorMessage = error.localizedDescription
+            isBusy = false
+            activityMessage = "空闲"
+        }
+    }
+
+    private func startDeferredRefresh(for generation: Int) {
+        let service = self.service
+
+        detailRefreshTask = Task {
+            do {
+                let snapshot = try await Task.detached(priority: .utility) {
+                    try service.loadSnapshot(
+                        includeBundleSizes: true,
+                        includeExternalStandaloneApps: true
+                    )
+                }.value
+
+                guard !Task.isCancelled, generation == refreshGeneration else {
+                    return
+                }
+
+                localApps = snapshot.localApps
+                migratedApps = snapshot.migratedApps
+                availableVolumes = snapshot.availableVolumes
+                alignDestinationSelection(using: snapshot.availableVolumes)
+            } catch is CancellationError {
+                return
+            } catch {
+                NSLog("Deferred snapshot refresh failed: %@", error.localizedDescription)
+            }
+        }
     }
 
     private func inferredSelectionKind(for url: URL, volumes: [StorageVolume]) -> DestinationSelectionKind {

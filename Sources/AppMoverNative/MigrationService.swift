@@ -4,6 +4,7 @@ enum MigrationError: LocalizedError {
     case invalidDestination
     case unsupportedApp(String)
     case missingMigrationRecord(String)
+    case insufficientDiskSpace(destinationPath: String, required: Int64, available: Int64)
     case commandFailed(String)
     case bundleScanFailed
 
@@ -15,6 +16,10 @@ enum MigrationError: LocalizedError {
             return "\(name) 属于系统或 Apple 预装应用，当前原型不会迁移它。"
         case let .missingMigrationRecord(name):
             return "没有找到 \(name) 的迁移记录，无法恢复。"
+        case let .insufficientDiskSpace(destinationPath, required, available):
+            let requiredText = ByteCountFormatter.string(fromByteCount: required, countStyle: .file)
+            let availableText = ByteCountFormatter.string(fromByteCount: available, countStyle: .file)
+            return "目标磁盘空间不足。\n目标位置：\(destinationPath)\n预计至少需要 \(requiredText)，当前可用 \(availableText)。"
         case let .commandFailed(message):
             return message
         case .bundleScanFailed:
@@ -27,14 +32,27 @@ struct MigrationService: Sendable {
     private let applicationsURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
     private let dockIntegrationService = DockIntegrationService()
 
-    func loadSnapshot() throws -> AppSnapshot {
+    func loadSnapshot(
+        includeBundleSizes: Bool = true,
+        includeExternalStandaloneApps: Bool = true
+    ) throws -> AppSnapshot {
         let manifestEntries = loadManifest()
         let volumeList = discoverVolumes()
-        let appListing = try discoverApps(using: manifestEntries)
-        let externalOnlyApps = discoverExternalStandaloneApps(
-            using: volumeList,
-            knownMigratedApps: appListing.migratedApps
+        let appListing = try discoverApps(
+            using: manifestEntries,
+            includeBundleSizes: includeBundleSizes
         )
+        let externalOnlyApps: [ManagedApp]
+
+        if includeExternalStandaloneApps {
+            externalOnlyApps = discoverExternalStandaloneApps(
+                using: volumeList,
+                knownMigratedApps: appListing.migratedApps,
+                includeBundleSizes: includeBundleSizes
+            )
+        } else {
+            externalOnlyApps = []
+        }
 
         return AppSnapshot(
             localApps: appListing.localApps,
@@ -121,6 +139,14 @@ struct MigrationService: Sendable {
             destinationRootPath: destinationDirectory.path
         )
         repairDockPinnedItem(for: app, targetURL: externalAppURL, matchingURLs: [app.originalURL])
+    }
+
+    func validateMigrationSpace(for apps: [ManagedApp], to destinationDirectory: URL) throws {
+        try validateAvailableSpace(
+            for: apps,
+            destinationURL: destinationDirectory,
+            fallbackExistingURL: destinationDirectory.deletingLastPathComponent()
+        )
     }
 
     func createSystemLink(for app: ManagedApp) throws {
@@ -240,6 +266,99 @@ struct MigrationService: Sendable {
         repairDockPinnedItem(for: app, targetURL: app.originalURL, matchingURLs: [externalURL])
     }
 
+    func validateRestoreSpace(for apps: [ManagedApp]) throws {
+        try validateAvailableSpace(
+            for: apps,
+            destinationURL: applicationsURL,
+            fallbackExistingURL: applicationsURL
+        )
+    }
+
+    func moveToTrash(_ app: ManagedApp) throws {
+        guard !app.isAppleApp else {
+            throw MigrationError.unsupportedApp(app.displayName)
+        }
+
+        switch app.residency {
+        case .local:
+            try runShellPreferringUser(trashScript(for: [app.currentURL.path]))
+        case let .migrated(externalURL, _, isReachable):
+            guard isReachable else {
+                throw MigrationError.commandFailed("外置盘中的应用当前不可访问，无法移到废纸篓。")
+            }
+
+            let script = """
+            set -eu
+            LINK=\(shellLiteral(app.originalURL.path))
+            EXT=\(shellLiteral(externalURL.path))
+
+            if [ -L "$LINK" ]; then
+              :
+            elif [ -e "$LINK" ] && [ "$LINK" != "$EXT" ]; then
+              echo "系统盘存在同名实体应用，已停止操作以避免误删。" >&2
+              exit 1
+            fi
+
+            \(trashScriptBody(for: app.hasSystemLink ? [app.originalURL.path, externalURL.path] : [externalURL.path]))
+            """
+
+            try runShellPreferringUser(script)
+        }
+
+        try removeManifestEntries(for: app)
+    }
+
+    func deletePermanently(_ app: ManagedApp) throws {
+        guard !app.isAppleApp else {
+            throw MigrationError.unsupportedApp(app.displayName)
+        }
+
+        switch app.residency {
+        case .local:
+            let script = """
+            set -eu
+            APP=\(shellLiteral(app.currentURL.path))
+
+            if [ ! -e "$APP" ] && [ ! -L "$APP" ]; then
+              echo "应用不存在，无法永久删除。" >&2
+              exit 1
+            fi
+
+            rm -rf "$APP"
+            """
+
+            try runShellPreferringUser(script)
+        case let .migrated(externalURL, _, isReachable):
+            guard isReachable else {
+                throw MigrationError.commandFailed("外置盘中的应用当前不可访问，无法永久删除。")
+            }
+
+            let script = """
+            set -eu
+            LINK=\(shellLiteral(app.originalURL.path))
+            EXT=\(shellLiteral(externalURL.path))
+
+            if [ -L "$LINK" ]; then
+              rm "$LINK"
+            elif [ -e "$LINK" ] && [ "$LINK" != "$EXT" ]; then
+              echo "系统盘存在同名实体应用，已停止永久删除以避免误删。" >&2
+              exit 1
+            fi
+
+            if [ ! -e "$EXT" ] && [ ! -L "$EXT" ]; then
+              echo "外置盘中的应用不存在，无法永久删除。" >&2
+              exit 1
+            fi
+
+            rm -rf "$EXT"
+            """
+
+            try runShellPreferringUser(script)
+        }
+
+        try removeManifestEntries(for: app)
+    }
+
     private func upsertMigrationEntry(
         appName: String,
         originalPath: String,
@@ -259,7 +378,10 @@ struct MigrationService: Sendable {
         try saveManifest(manifestEntries)
     }
 
-    private func discoverApps(using manifestEntries: [MigrationEntry]) throws -> (localApps: [ManagedApp], migratedApps: [ManagedApp]) {
+    private func discoverApps(
+        using manifestEntries: [MigrationEntry],
+        includeBundleSizes: Bool
+    ) throws -> (localApps: [ManagedApp], migratedApps: [ManagedApp]) {
         let fileManager = FileManager.default
         let manifestByOriginal = Dictionary(uniqueKeysWithValues: manifestEntries.map { ($0.originalPath, $0) })
         let directoryContents: [URL]
@@ -291,6 +413,7 @@ struct MigrationService: Sendable {
                         id: itemURL.path,
                         displayName: itemURL.deletingPathExtension().lastPathComponent,
                         bundleIdentifier: bundleIdentifier(for: resolvedURL),
+                        bundleSize: includeBundleSizes ? appSize(for: resolvedURL) : nil,
                         originalURL: itemURL,
                         currentURL: resolvedURL,
                             residency: .migrated(
@@ -309,6 +432,7 @@ struct MigrationService: Sendable {
                 id: itemURL.path,
                 displayName: itemURL.deletingPathExtension().lastPathComponent,
                 bundleIdentifier: bundleIdentifier,
+                bundleSize: includeBundleSizes ? appSize(for: itemURL) : nil,
                 originalURL: itemURL,
                 currentURL: itemURL,
                 residency: .local,
@@ -330,7 +454,8 @@ struct MigrationService: Sendable {
 
     private func discoverExternalStandaloneApps(
         using volumes: [StorageVolume],
-        knownMigratedApps: [ManagedApp]
+        knownMigratedApps: [ManagedApp],
+        includeBundleSizes: Bool
     ) -> [ManagedApp] {
         let fileManager = FileManager.default
         let knownExternalPaths = Set(knownMigratedApps.map(\.currentURL.path))
@@ -384,6 +509,7 @@ struct MigrationService: Sendable {
                             id: "external::\(candidateURL.path)",
                             displayName: candidateURL.deletingPathExtension().lastPathComponent,
                             bundleIdentifier: bundleIdentifier,
+                            bundleSize: includeBundleSizes ? appSize(for: candidateURL) : nil,
                             originalURL: expectedSystemURL,
                             currentURL: candidateURL,
                             residency: .migrated(
@@ -475,6 +601,195 @@ struct MigrationService: Sendable {
 
     private func bundleIdentifier(for url: URL) -> String? {
         Bundle(url: url)?.bundleIdentifier
+    }
+
+    private func appSize(for url: URL) -> Int64? {
+        let resourceKeys: Set<URLResourceKey> = [
+            .isRegularFileKey,
+            .fileAllocatedSizeKey,
+            .totalFileAllocatedSizeKey,
+        ]
+
+        if let values = try? url.resourceValues(forKeys: resourceKeys),
+           let size = values.totalFileAllocatedSize ?? values.fileAllocatedSize {
+            return Int64(size)
+        }
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: [.skipsHiddenFiles],
+            errorHandler: { _, _ in true }
+        ) else {
+            return nil
+        }
+
+        var totalSize: Int64 = 0
+
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: resourceKeys),
+                  values.isRegularFile == true else {
+                continue
+            }
+
+            if let size = values.totalFileAllocatedSize ?? values.fileAllocatedSize {
+                totalSize += Int64(size)
+            }
+        }
+
+        return totalSize > 0 ? totalSize : nil
+    }
+
+    private func validateAvailableSpace(
+        for apps: [ManagedApp],
+        destinationURL: URL,
+        fallbackExistingURL: URL
+    ) throws {
+        guard !apps.isEmpty else {
+            return
+        }
+
+        let required = totalRequiredSpace(for: apps)
+        guard required > 0 else {
+            return
+        }
+
+        guard let available = availableSpace(at: destinationURL, fallbackExistingURL: fallbackExistingURL) else {
+            return
+        }
+
+        if required > available {
+            throw MigrationError.insufficientDiskSpace(
+                destinationPath: destinationURL.path,
+                required: required,
+                available: available
+            )
+        }
+    }
+
+    private func totalRequiredSpace(for apps: [ManagedApp]) -> Int64 {
+        let total = apps.reduce(into: Int64(0)) { partialResult, app in
+            let sourceURL = app.currentURL
+            if let knownSize = app.bundleSize {
+                partialResult += knownSize
+            } else if let measuredSize = appSize(for: sourceURL) {
+                partialResult += measuredSize
+            }
+        }
+
+        guard total > 0 else {
+            return 0
+        }
+
+        let safetyBuffer = max(total / 20, 256 * 1024 * 1024)
+        return total + safetyBuffer
+    }
+
+    private func availableSpace(at destinationURL: URL, fallbackExistingURL: URL) -> Int64? {
+        let fileManager = FileManager.default
+        let probeURL = existingURL(forFileSystemProbe: destinationURL) ?? existingURL(forFileSystemProbe: fallbackExistingURL)
+
+        guard let probePath = probeURL?.path,
+              let attributes = try? fileManager.attributesOfFileSystem(forPath: probePath) else {
+            return nil
+        }
+
+        if let freeSize = attributes[.systemFreeSize] as? NSNumber {
+            return freeSize.int64Value
+        }
+
+        return nil
+    }
+
+    private func existingURL(forFileSystemProbe url: URL) -> URL? {
+        var candidate = url
+        let fileManager = FileManager.default
+
+        while candidate.path != "/" {
+            if fileManager.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+            candidate.deleteLastPathComponent()
+        }
+
+        return fileManager.fileExists(atPath: "/") ? URL(fileURLWithPath: "/", isDirectory: true) : nil
+    }
+
+    private func removeManifestEntries(for app: ManagedApp) throws {
+        let manifestEntries = loadManifest().filter {
+            $0.originalPath != app.originalURL.path && $0.externalPath != app.currentURL.path
+        }
+        try saveManifest(manifestEntries)
+    }
+
+    private func trashScript(for paths: [String]) -> String {
+        """
+        set -eu
+        \(trashScriptBody(for: paths))
+        """
+    }
+
+    private func trashScriptBody(for paths: [String]) -> String {
+        let uid = String(getuid())
+        let homeTrashPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".Trash", isDirectory: true)
+            .path
+        let items = paths.map(shellLiteral).joined(separator: " ")
+
+        return """
+        USER_TRASH=\(shellLiteral(homeTrashPath))
+        USER_ID=\(shellLiteral(uid))
+
+        unique_destination() {
+          TRASH_DIR="$1"
+          NAME="$2"
+          EXT=""
+          BASE="$NAME"
+
+          case "$NAME" in
+            *.app)
+              EXT=".app"
+              BASE="${NAME%.app}"
+              ;;
+          esac
+
+          DEST="$TRASH_DIR/$NAME"
+          if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+            SUFFIX="$(date +%Y%m%d-%H%M%S)"
+            DEST="$TRASH_DIR/$BASE-$SUFFIX$EXT"
+          fi
+
+          printf '%s' "$DEST"
+        }
+
+        trash_item() {
+          SRC="$1"
+
+          if [ ! -e "$SRC" ] && [ ! -L "$SRC" ]; then
+            echo "应用不存在，无法移到废纸篓。" >&2
+            exit 1
+          fi
+
+          case "$SRC" in
+            /Volumes/*)
+              REST="${SRC#/Volumes/}"
+              VOLUME_NAME="${REST%%/*}"
+              TRASH_DIR="/Volumes/$VOLUME_NAME/.Trashes/$USER_ID"
+              ;;
+            *)
+              TRASH_DIR="$USER_TRASH"
+              ;;
+          esac
+
+          mkdir -p "$TRASH_DIR"
+          DEST="$(unique_destination "$TRASH_DIR" "$(basename "$SRC")")"
+          mv "$SRC" "$DEST"
+        }
+
+        for ITEM in \(items); do
+          trash_item "$ITEM"
+        done
+        """
     }
 
     private func loadManifest() -> [MigrationEntry] {
